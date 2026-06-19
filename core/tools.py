@@ -28,6 +28,8 @@ class ToolRegistry:
         """注册内置工具"""
         self.tools["web_search"] = WebSearchTool()
         self.tools["read_file"] = ReadFileTool()
+        self.tools["write_file"] = WriteFileTool()      # ✅ 新增
+        self.tools["edit_file"] = EditFileTool()        # ✅ 新增
         self.tools["execute_code"] = ExecuteCodeTool()
         self.tools["list_dir"] = ListDirTool()
         self.tools["image_generator"] = ImageGeneratorTool()
@@ -425,6 +427,133 @@ class ImageGeneratorTool(BaseTool):
         
         except Exception as e:
             logger.error(f"生成图片失败: {e}", exc_info=True)
+            return {
+                "success": False,
+                "error": str(e)
+            }
+
+
+class WriteFileTool(BaseTool):
+    """文件写入工具"""
+    
+    name = "write_file"
+    description = "创建或覆盖文件"
+    
+    async def execute(self, file_path: str, content: str) -> Dict[str, Any]:
+        """
+        写入文件
+        
+        Args:
+            file_path: 文件路径
+            content: 文件内容
+        
+        Returns:
+            {"success": bool, "message": str}
+        """
+        try:
+            logger.info(f"写入文件: {file_path} ({len(content)} 字符)")
+            
+            # 安全检查
+            safe_path = Path(file_path).resolve()
+            
+            # 确保目录存在
+            safe_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            # 写入文件
+            with open(safe_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+            
+            logger.info(f"✅ 文件写入成功: {file_path}")
+            
+            return {
+                "success": True,
+                "message": f"文件写入成功: {file_path}",
+                "file_path": str(safe_path),
+                "size": len(content)
+            }
+        
+        except Exception as e:
+            logger.error(f"❌ 文件写入失败: {e}", exc_info=True)
+            return {
+                "success": False,
+                "error": str(e)
+            }
+
+
+class EditFileTool(BaseTool):
+    """文件编辑工具"""
+    
+    name = "edit_file"
+    description = "精确修改文件内容"
+    
+    async def execute(
+        self,
+        file_path: str,
+        old_text: str,
+        new_text: str,
+        replace_all: bool = False
+    ) -> Dict[str, Any]:
+        """
+        编辑文件
+        
+        Args:
+            file_path: 文件路径
+            old_text: 要替换的文本
+            new_text: 替换后的文本
+            replace_all: 是否替换所有出现（默认只替换第一个）
+        
+        Returns:
+            {"success": bool, "message": str, "changes": int}
+        """
+        try:
+            logger.info(f"编辑文件: {file_path}")
+            
+            # 安全检查
+            safe_path = Path(file_path).resolve()
+            
+            # 检查文件是否存在
+            if not safe_path.exists():
+                return {
+                    "success": False,
+                    "error": f"文件不存在: {file_path}"
+                }
+            
+            # 读取文件
+            with open(safe_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            # 统计出现次数
+            count = content.count(old_text)
+            
+            if count == 0:
+                return {
+                    "success": False,
+                    "error": f"未找到要替换的文本: {old_text[:50]}..."
+                }
+            
+            # 替换
+            if replace_all:
+                new_content = content.replace(old_text, new_text)
+            else:
+                new_content = content.replace(old_text, new_text, 1)
+            
+            # 写回文件
+            with open(safe_path, 'w', encoding='utf-8') as f:
+                f.write(new_content)
+            
+            actual_changes = count if replace_all else 1
+            
+            logger.info(f"✅ 文件编辑成功: {file_path} ({actual_changes} 处修改)")
+            
+            return {
+                "success": True,
+                "message": f"文件编辑成功: {actual_changes} 处修改",
+                "file_path": str(safe_path),
+                "changes": actual_changes
+            }
+        
+        except Exception as e:
+            logger.error(f"❌ 文件编辑失败: {e}", exc_info=True)
             return {
                 "success": False,
                 "error": str(e)
