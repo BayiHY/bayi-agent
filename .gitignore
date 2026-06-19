@@ -1,0 +1,64 @@
+# 敏感配置文件
+bayi_config.yaml
+*.secret.yaml
+*.secret.json
+.env
+.env.*
+
+# 运行时数据
+agent_data/
+agents/*.json
+*.db
+*.sqlite
+*.sqlite3
+
+# 日志文件
+logs/
+*.log
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 虚拟环境
+venv/
+ENV/
+env/
+.venv
+
+# IDE 配置
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 操作系统
+.DS_Store
+Thumbs.db
+
+# 模型性能数据
+model_performance.json
+
+# 临时文件
+tmp/
+temp/
+*.tmp

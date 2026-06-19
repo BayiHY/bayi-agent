@@ -1,0 +1,117 @@
+# Bayi-Agent 配置文件示例
+# 复制此文件为 bayi_config.yaml 并填入实际值
+
+# 飞书渠道配置
+feishu:
+  app_id: "your_app_id_here"
+  app_secret: "your_app_secret_here"
+  encrypt_key: ""
+  event_callback: "/webhook/feishu"
+
+# Tavily API 配置（用于网络搜索）
+tavily:
+  api_key: "your_tavily_api_key_here"
+  api_base: "https://api.tavily.com/search"
+
+# 入口模型配置（用于意图分类+口语回复）
+entry_model:
+  name: "agnes-2.0-flash"
+  api_base: "https://apihub.agnes-ai.com/v1"
+  api_key: "your_api_key_here"
+  temperature: 0.3
+  max_tokens: 500
+  timeout: 30
+  max_retries: 2
+
+# 决策模型配置（用于复杂任务分析）
+decision_model:
+  name: "GLM-5"
+  api_base: "https://modelservice.jdcloud.com/coding/openai/v1"
+  api_key: "your_api_key_here"
+  temperature: 0.7
+  max_tokens: 4000
+  timeout: 60
+
+# 模型池配置（用于模型切换和降级）
+model_pool:
+  # 主力模型（用于代码生成、执行任务）
+  primary:
+    name: "GLM-5"
+    api_base: "https://modelservice.jdcloud.com/coding/openai/v1"
+    api_key: "your_api_key_here"
+    temperature: 0.7
+    max_tokens: 4000
+    timeout: 60
+  
+  # 备用模型 1（用于网络搜索、信息提取）
+  fallback_1:
+    name: "agnes-2.0-flash"
+    api_base: "https://apihub.agnes-ai.com/v1"
+    api_key: "your_api_key_here"
+    temperature: 0.5
+    max_tokens: 3000
+    timeout: 30
+  
+  # 备用模型 2（用于简单任务）
+  fallback_2:
+    name: "agnes-2.0-flash"
+    api_base: "https://apihub.agnes-ai.com/v1"
+    api_key: "your_api_key_here"
+    temperature: 0.3
+    max_tokens: 2000
+    timeout: 20
+
+# 任务类型到模型的映射
+model_routing:
+  code_execution: "primary"      # 代码执行任务
+  web_search: "fallback_1"       # 网络搜索任务
+  data_analysis: "primary"       # 数据分析任务
+  text_generation: "fallback_1"  # 文本生成任务
+  simple_query: "fallback_2"     # 简单查询任务
+
+# 简单任务模型配置（可选，默认复用 entry_model）
+simple_model:
+  name: "agnes-2.0-flash"
+  api_base: "https://apihub.agnes-ai.com/v1"
+  api_key: "your_api_key_here"
+  temperature: 0.5
+  max_tokens: 2000
+  timeout: 20
+
+# 队列配置
+queue:
+  max_size: 100
+  max_workers: 3
+  db_path: "/tmp/bayi-tasks/queue.db"
+  log_dir: "/tmp/bayi-tasks/"
+
+# 日志配置
+log:
+  level: "INFO"
+  format: "[%(asctime)s] %(levelname)s | %(message)s"
+
+# 智能体配置
+agents:
+  max_temporary: 5
+  specialized:
+    architect:
+      skills: ["architecture-analysis", "design-patterns"]
+      tools: ["read_file", "search_web", "draw_diagram"]
+      description: "架构分析专家"
+    analyst:
+      skills: ["data-analysis", "statistics"]
+      tools: ["read_file", "execute_code", "draw_chart"]
+      description: "数据分析专家"
+    researcher:
+      skills: ["web-search", "document-analysis"]
+      tools: ["search_web", "read_file", "summarize"]
+      description: "研究调查专家"
+    coder:
+      skills: ["code-analysis", "debugging"]
+      tools: ["read_file", "execute_code", "git"]
+      description: "代码分析专家"
+
+# 上下文拆分配置
+context_splitter:
+  max_tokens_per_subtask: 5000
+  max_chars_per_subtask: 15000

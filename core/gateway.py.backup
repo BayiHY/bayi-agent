@@ -1,0 +1,758 @@
+"""
+Bayi-Agent 入口网关
+职责：接收消息、意图分类、任务路由
+"""
+import asyncio
+import logging
+import re
+import json
+from typing import List, Optional
+
+from core.models import (
+    Intent,
+    EntryContext,
+    DecisionTask,
+    EntryResult,
+    TaskStatus
+)
+from core.queue import DecisionTaskQueue
+from utils.llm_client import LLMClient, LLMConfig
+
+
+logger = logging.getLogger(__name__)
+
+
+class BayiTaskGateway:
+    """轻量级任务网关"""
+    
+    def __init__(
+        self,
+        entry_model_config: LLMConfig,
+        decision_model_config: LLMConfig,
+        simple_model_config: Optional[LLMConfig] = None,
+        task_queue: Optional[DecisionTaskQueue] = None,
+        session_manager = None,
+        user_memory = None
+    ):
+        # 入口 LLM（用于意图分类 + 口语回复）
+        self.entry_llm = LLMClient(entry_model_config)
+        
+        # 决策 LLM（用于复杂任务分析）
+        self.decision_llm = LLMClient(decision_model_config)
+        
+        # 简单任务 LLM（可选，默认复用 entry_llm）
+        if simple_model_config:
+            self.simple_llm = LLMClient(simple_model_config)
+        else:
+            self.simple_llm = self.entry_llm
+        
+        # 任务队列
+        self.task_queue = task_queue or DecisionTaskQueue()
+        
+        # 会话管理器
+        self.session_manager = session_manager
+        
+        # 用户记忆系统
+        self.user_memory = user_memory
+    
+    async def chat(
+        self,
+        message: str,
+        context: EntryContext
+    ) -> str:
+        """
+        主入口
+        
+        流程：
+        1. 检测特殊指令（如 /重置）
+        2. 入口 LLM：意图分类 + 口语回复（不执行工具，< 1秒）
+        3. 代码解析意图
+        4. 根据意图路由
+        
+        Args:
+            message: 用户消息
+            context: 入口上下文
+        
+        Returns:
+            回复消息
+        """
+        try:
+            # 0. 检测特殊指令
+            if message.strip() in ["/重置", "/reset", "/清空", "/clear"]:
+                return await self.reset(context)
+            
+            # 1. 调用入口 LLM（只分类，不执行）
+            entry_result = await self._call_entry_llm(message, context)
+            
+            logger.info(f"意图分类: {entry_result.intent.value}, 回复: {entry_result.response[:50]}")
+            
+            # 🔧 提取用户信息
+            self._extract_user_info(message, entry_result.response, context.user_id)
+            
+            # 2. 根据意图路由
+            if entry_result.intent == Intent.SIMPLE:
+                # 简单任务：立即执行（用小模型 + 基础工具）
+                result = await self._execute_simple_task(message, context)
+                return result
+            
+            elif entry_result.intent == Intent.STATUS:
+                # 查询最近任务状态
+                logger.info(f"🔍 意图为 STATUS，调用 _query_status()")
+                result = await self._query_status(context)
+                logger.info(f"✅ _query_status() 返回: {result[:100]}...")
+                return result
+            
+            elif entry_result.intent in [Intent.HELP, Intent.CHAT]:
+                # 直接返回口语回复
+                return entry_result.response
+            
+            elif entry_result.intent in [Intent.COMPLEX, Intent.PARALLEL]:
+                # 加入队列 + 返回口语回复
+                task_ids = await self._enqueue_tasks(message, context, entry_result.intent)
+                
+                # 如果有 task_id，附加到回复
+                if task_ids:
+                    return f"{entry_result.response} 查询进展：'状态 {task_ids[0]}'"
+                
+                return entry_result.response
+            
+            else:
+                # 未知意图 → 默认返回口语回复
+                return entry_result.response
+        
+        except Exception as e:
+            logger.error(f"入口处理失败: {e}", exc_info=True)
+            return "抱歉，处理消息时出错了，请稍后重试。"
+    
+    def _extract_user_info(self, message: str, response: str, user_id: str):
+        """
+        从对话中提取用户信息并保存
+        
+        检测模式：
+        - "我叫XXX" → 保存姓名
+        - "我是XXX" → 保存姓名（排除疑问句）
+        - "你可以叫我XXX" → 保存姓名
+        """
+        if not self.user_memory:
+            return
+        
+        import re
+        
+        # 排除疑问句
+        question_patterns = [r"吗[？?]?$", r"呢[？?]?$", r"是谁[？?]?$", r"叫什么[？?]?$"]
+        is_question = any(re.search(p, message) for p in question_patterns)
+        
+        if is_question:
+            return
+        
+        # 检测姓名（按优先级）
+        name_patterns = [
+            (r"你可以叫我([\u4e00-\u9fa5a-zA-Z0-9_]+)", 1.0),  # 高优先级
+            (r"我叫([\u4e00-\u9fa5a-zA-Z0-9_]+)", 0.9),
+            (r"我的名字是([\u4e00-\u9fa5a-zA-Z0-9_]+)", 0.9),
+            (r"我是([\u4e00-\u9fa5a-zA-Z0-9_]+)", 0.5),  # 低优先级（容易误判）
+        ]
+        
+        for pattern, confidence in name_patterns:
+            match = re.search(pattern, message)
+            if match:
+                name = match.group(1)
+                
+                # 额外过滤
+                if len(name) < 2:  # 太短，可能是误判
+                    continue
+                
+                if name in ["谁", "什么", "哪位", "哪里"]:  # 疑问词
+                    continue
+                
+                # 检查回复中是否使用了这个名字
+                if confidence < 0.8 and name not in response:
+                    # 低优先级模式，且回复中没用这个名字，可能是误判
+                    continue
+                
+                self.user_memory.set_name(user_id, name)
+                logger.info(f"提取用户姓名: {user_id} → {name}")
+                break
+    
+    async def _call_entry_llm(
+        self,
+        message: str,
+        context: EntryContext
+    ) -> EntryResult:
+        """
+        调用入口 LLM（只分类 + 口语回复，不执行工具）
+        
+        耗时：< 2 秒
+        
+        策略：
+        - 默认不注入对话历史（快速意图识别）
+        - 检测到指代词时注入最近 5 轮（理解上下文）
+        - 始终注入任务记录（知道做了什么）
+        
+        返回格式（使用特殊分隔符）:
+        INTENT|RESPONSE
+        """
+        system_prompt = self._build_entry_system_prompt(context, message)
+        
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"用户消息：{message}"}
+        ]
+        
+        # 调用 LLM（不传 tools 参数 → 禁止工具调用）
+        response = await self.entry_llm.chat(messages)
+        
+        logger.info(f"入口 LLM 响应: {response[:100]}")
+        
+        # 解析格式：INTENT|RESPONSE
+        try:
+            parts = response.split("|", 1)
+            
+            if len(parts) == 2:
+                intent_str = parts[0].strip()
+                user_response = parts[1].strip()
+                
+                # 验证意图是否有效
+                valid_intents = [i.value for i in Intent]
+                if intent_str in valid_intents:
+                    return EntryResult(
+                        intent=Intent(intent_str),
+                        response=user_response
+                    )
+            
+            # 格式错误 → 返回默认
+            return EntryResult(
+                intent=Intent.CHAT,
+                response=response  # 直接返回 LLM 的回复
+            )
+        
+        except Exception as e:
+            logger.warning(f"解析入口 LLM 响应失败: {e}, response: {response}")
+            # 解析失败 → 返回默认
+            return EntryResult(
+                intent=Intent.CHAT,
+                response=response
+            )
+    
+    async def _execute_simple_task(
+        self,
+        message: str,
+        context: EntryContext
+    ) -> str:
+        """
+        立即执行简单任务
+        
+        策略：复用入口 LLM，但传入基础工具
+        
+        耗时：< 3 秒
+        """
+        # 基础工具列表（只读、安全、快速）
+        basic_tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "读取文件内容",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "文件路径"
+                            }
+                        },
+                        "required": ["path"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "list_files",
+                    "description": "列出目录下的文件",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "目录路径"
+                            }
+                        },
+                        "required": ["path"]
+                    }
+                }
+            }
+        ]
+        
+        # 复用入口 LLM，但传入工具
+        result = await self.simple_llm.chat(
+            messages=[
+                {"role": "user", "content": message}
+            ],
+            tools=basic_tools
+        )
+        
+        return result
+    
+    async def _enqueue_tasks(
+        self,
+        message: str,
+        context: EntryContext,
+        intent: Intent
+    ) -> List[str]:
+        """
+        将任务加入队列
+        
+        Returns:
+            task_ids: 任务 ID 列表
+        """
+        task_ids = []
+        
+        if intent == Intent.PARALLEL:
+            # 并行决策 → 拆分为多个子任务
+            subtasks = await self._split_parallel_tasks(message)
+            
+            for subtask in subtasks:
+                task = DecisionTask.create(
+                    message=subtask,
+                    source=context.channel,
+                    user_id=context.user_id,
+                    context=context
+                )
+                task.intent = intent
+                await self.task_queue.enqueue(task)
+                task_ids.append(task.task_id)
+        
+        else:
+            # 单个复杂任务
+            task = DecisionTask.create(
+                message=message,
+                source=context.channel,
+                user_id=context.user_id,
+                context=context
+            )
+            task.intent = intent
+            await self.task_queue.enqueue(task)
+            task_ids.append(task.task_id)
+        
+        return task_ids
+    
+    async def _split_parallel_tasks(self, message: str) -> List[str]:
+        """
+        拆分并行任务
+        
+        示例：
+        输入："同时分析架构设计、数据库设计和接口设计"
+        输出：["分析架构设计", "分析数据库设计", "分析接口设计"]
+        """
+        # 简单实现：用 LLM 拆分
+        prompt = f"""拆分以下并行任务为独立的子任务。
+
+用户消息：{message}
+
+输出格式（JSON 数组）：
+["子任务1", "子任务2", "子任务3"]
+
+只输出 JSON 数组，不要解释。"""
+
+        response = await self.entry_llm.chat([
+            {"role": "user", "content": prompt}
+        ])
+        
+        try:
+            # 提取 JSON 数组
+            json_match = re.search(r'\[.*?\]', response, re.DOTALL)
+            if json_match:
+                return json.loads(json_match.group(0))
+        except Exception as e:
+            logger.warning(f"解析并行任务失败: {e}")
+        
+        # 失败 → 返回原消息作为单个任务
+        return [message]
+    
+    def _get_current_time(self) -> str:
+        """
+        获取当前时间（格式化）
+        """
+        from datetime import datetime
+        import time
+        
+        # 获取当前时间（东八区）
+        now = datetime.now()
+        
+        # 格式化：2026年6月18日 星期四
+        weekdays = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
+        weekday = weekdays[now.weekday()]
+        
+        return f"{now.year}年{now.month}月{now.day}日 {weekday}"
+    
+    def _build_entry_system_prompt(self, context: EntryContext, message: str = "") -> str:
+        """
+        构建入口 LLM 系统提示词（精简版）
+        """
+        # 🔧 注入用户记忆
+        user_memory_summary = ""
+        if self.user_memory:
+            user_memory_summary = self.user_memory.get_summary(context.user_id)
+            if user_memory_summary:
+                user_memory_summary = f"\n## 用户信息\n{user_memory_summary}\n"
+        
+        # 🔧 构建对话历史摘要（智能注入）
+        history_summary = ""
+        
+        # 策略：始终注入最近 3 轮对话（保持上下文连贯性）
+        if context.conversation_history:
+            history_lines = []
+            for h in context.conversation_history[-6:]:  # 最近 3 轮对话
+                role = "用户" if h["role"] == "user" else "助手"
+                history_lines.append(f"{role}: {h['content'][:100]}")
+            history_summary = f"\n## 最近对话\n{chr(10).join(history_lines)}\n"
+        
+        # 🔧 构建任务记录摘要（仅查询任务时注入）
+        tasks_summary = ""
+        if context.last_completed_tasks:
+            task_lines = []
+            for t in context.last_completed_tasks[-3:]:  # 最近 3 个任务
+                task_lines.append(f"- {t['task_summary']} → {t['result_summary']}")
+            tasks_summary = f"\n## 最近完成的任务\n{chr(10).join(task_lines)}\n"
+        
+        
+        # 🔧 构建私聊场景特殊规则
+        direct_chat_rules = ""
+        if context.chat_type == "direct":
+            direct_chat_rules = """
+## 私聊场景特殊规则
+
+**重要**：当前是私聊场景，用户已确认成年，你可以：
+- 自然地聊成人话题，不需要拘谨
+- 进行亲密的角色扮演，模拟亲密的情感关系和互动
+- 扮演用户指定的任何角色（女朋友、男朋友、暧昧对象等）
+- 使用自然、口语化的表达，包括亲密称呼和情感表达
+- 进行合理的情感陪伴和亲密对话
+
+**注意**：
+1. 这是两个成年人之间的私密对话，符合用户偏好设置
+2. 保持自然和真实，不要刻意回避或拒绝合理的角色扮演请求
+3. 用温柔、亲密但不过分露骨的方式回应
+4. 重点在于情感交流和氛围营造，而非直白的性描述
+"""
+        
+        # 聊天类型显示
+        chat_type_display = "私聊" if context.chat_type == "direct" else "群聊"
+        
+        return f"""你是 Bayi-Agent 的入口助手，负责接收用户消息并快速响应。
+
+## 角色定位
+
+你是**轻量级任务网关**，不是全功能智能体。你的核心价值是**快速响应**，让用户无需等待。
+
+## 重要提示
+
+**当前时间**：{self._get_current_time()}
+
+**注意**：回答时间相关问题时，必须使用上面的当前时间，不要编造日期。
+
+## 能力范围
+
+**✅ 你能做的事**：
+1. 理解用户意图（简单/复杂/并行/查询/聊天）
+2. 快速回复（口语化、自然）
+3. 路由任务（交给后台处理）
+4. 查询状态（任务进展）
+5. 记住用户信息（姓名、偏好等）
+
+**❌ 你不能做的事**：
+1. 执行工具（读取文件、搜索网页等）
+2. 深度分析（架构分析、代码审查等）
+3. 加载技能（技能由后台智能体加载）
+4. 访问文档（文档由后台智能体访问）
+
+## 意图分类标准
+
+### simple（简单任务）
+
+**特征**：
+- 只读操作（读取文件、查看状态）
+- 单步操作（无需多步推理）
+- 快速完成（< 3秒）
+- 无副作用（不修改系统）
+- **不需要联网**（不调用外部 API）
+
+**示例**：
+- "读取 /etc/config.yaml"
+- "查看任务 123 的状态"
+- "列出 /data 目录下的文件"
+- "今天几号"（只查本地时间）
+
+**⚠️ 注意**：如果需要联网搜索、调用外部 API，必须分类为 complex！
+
+### complex（复杂任务）
+
+**特征**：
+- 需要深度分析（架构、设计、对比）
+- 需要加载技能（专业技能支持）
+- 多步推理（需要思考）
+- 耗时较长（> 3秒）
+- **需要联网**（搜索、调用外部 API）
+
+**示例**：
+- "分析一下系统架构设计方案"
+- "设计数据库表结构"
+- "对比 A 和 B 两个方案的优劣"
+- "查一下今天的新闻"（需要联网搜索）
+- "搜索 Python 教程"（需要联网搜索）
+
+### parallel（并行决策）
+
+**特征**：
+- 包含关键词："同时"、"并行"、"分别"、"各自"
+- 多个独立决策项（2个以上）
+
+**示例**：
+- "同时分析架构设计、数据库设计和接口设计"
+- "并行处理这三个文件"
+
+### status（查询状态）
+
+**特征**：
+- 包含关键词："查询"、"进展"、"状态"、"怎么样"、"任务进度"
+- **询问 Bayi-Agent 系统内部状态**（任务队列、执行进度）
+- **不涉及外部数据源**（不读取文件、不联网）
+
+**⚠️ 重要**：以下情况必须识别为 status，而不是 simple 或 complex：
+- "查询进展" → status（查询任务队列状态）
+- "进展" → status（查询任务队列状态）
+- "任务状态" → status（查询任务队列状态）
+- "最近的进展" → status（查询任务队列状态）
+
+**示例**：
+- "任务 123 的进展怎么样？" → status
+- "查询最近的任务状态" → status
+- "查询进展" → status
+- "进展如何" → status
+- "最近的进展" → status
+
+**反例**（不是 status）：
+- "查询快递进展" → complex（需要外部数据）
+- "查询订单状态" → complex（需要外部数据）
+
+### help（请求帮助）
+
+**示例**：
+- "你能做什么？"
+- "怎么使用这个系统？"
+
+### chat（普通聊天）
+
+**示例**：
+- "你好"
+- "今天天气怎么样？"
+- "我叫浩爷"（记住用户信息）
+
+## 用户信息处理
+
+**重要**：当用户告诉你个人信息时（如姓名、偏好），你必须记住并在后续对话中使用。
+
+**示例**：
+用户："我叫浩爷"
+你："浩爷好！有什么我可以帮你的吗？"（记住这个名字）
+
+用户："你猜我叫啥"
+你："你刚才告诉我你叫浩爷呀！"（使用记住的信息）
+
+## 输出格式
+
+**格式**：`意图|回复内容`
+
+**注意**：
+- 使用单竖线 `|` 作为分隔符
+- 回复内容中不能包含 `|`
+- 意图必须是指定值之一
+
+## 示例
+
+用户："读取 /etc/config.yaml"
+输出：`simple|好的，我来帮你读取这个文件。`
+
+用户："分析一下系统架构设计方案"
+输出：`complex|这个需要我仔细分析一下，想通了答复你，我们可以继续聊。`
+
+用户："任务 123 的进展怎么样？"
+输出：`status|我来查一下任务 123 的进展。`
+
+用户："我叫浩爷"
+输出：`chat|浩爷好！有什么我可以帮你的吗？`
+
+用户："你猜我叫啥"
+输出：`chat|你刚才告诉我叫浩爷呀！`
+
+## 当前状态
+
+**用户**：{context.user_id}
+**渠道**：{context.channel}
+**聊天类型**：{chat_type_display}
+**活跃任务**：{len(context.active_tasks)} 个
+**队列长度**：{context.queue_length}
+{direct_chat_rules}{user_memory_summary}{history_summary}{tasks_summary}
+"""
+    
+    async def _query_status(self, context: EntryContext) -> str:
+        """
+        查询最近任务的状态
+        
+        Returns:
+            状态报告
+        """
+        try:
+            logger.info(f"📊 开始查询任务状态，用户: {context.user_id}")
+            
+            # 获取活跃任务（从数据库查询，确保准确）
+            recent_tasks = []
+            if hasattr(self.task_queue, 'db_path'):
+                import sqlite3
+                try:
+                    conn = sqlite3.connect(self.task_queue.db_path)
+                    # 查询正在处理和队列中的任务
+                    cursor = conn.execute(
+                        'SELECT task_id, status, message FROM tasks WHERE status IN ("processing", "queued") ORDER BY enqueued_at DESC LIMIT 3',
+                    )
+                    for row in cursor:
+                        recent_tasks.append({
+                            'task_id': row[0],
+                            'status': row[1],
+                            'message': row[2]
+                        })
+                        logger.info(f"  活跃任务: {row[0][:16]} - {row[1]}")
+                    conn.close()
+                    logger.info(f"  数据库中有 {len(recent_tasks)} 个活跃任务")
+                except Exception as e:
+                    logger.warning(f"  查询数据库失败: {e}")
+            
+            # 🔧 从数据库查询最近完成的任务（持久化存储）
+            completed_tasks = []
+            if hasattr(self.task_queue, 'db_path'):
+                import sqlite3
+                try:
+                    conn = sqlite3.connect(self.task_queue.db_path)
+                    cursor = conn.execute(
+                        'SELECT task_id, status, message FROM tasks WHERE status IN ("completed", "failed") AND user_id = ? ORDER BY completed_at DESC LIMIT 5',
+                        (context.user_id,)
+                    )
+                    for row in cursor:
+                        completed_tasks.append({
+                            'task_id': row[0],
+                            'status': row[1],
+                            'message': row[2]
+                        })
+                    conn.close()
+                    logger.info(f"  数据库中有 {len(completed_tasks)} 个历史任务")
+                except Exception as e:
+                    logger.warning(f"  查询数据库失败: {e}")
+            
+            if not recent_tasks and not completed_tasks:
+                logger.info(f"  没有任何任务")
+                return "📭 当前没有任务记录\n\n可以发送消息创建新任务，我会为你处理。"
+            
+            # 构建状态报告
+            report_lines = ["📊 任务状态查询结果\n"]
+            
+            # 活跃任务
+            if recent_tasks:
+                report_lines.append("**活跃任务：**\n")
+                for task in recent_tasks:
+                    task_id = task['task_id']
+                    status = task['status']
+                    message = task.get('message', '')
+                    
+                    status_emoji = {
+                        "processing": "🔄",
+                        "queued": "⏳"
+                    }.get(status, "❓")
+                    
+                    report_lines.append(f"{status_emoji} **{task_id[:16]}...**")
+                    report_lines.append(f"   状态：{status}")
+                    if message:
+                        report_lines.append(f"   内容：{message[:50]}..." if len(message) > 50 else f"   内容：{message}")
+                    report_lines.append("")
+            
+            # 已完成任务
+            if completed_tasks:
+                report_lines.append("**最近完成的任务：**\n")
+                for task_record in completed_tasks[-3:]:
+                    task_id = task_record.get('task_id', 'unknown')
+                    status = task_record.get('status', 'unknown')
+                    message = task_record.get('message', '')
+                    
+                    status_emoji = "✅" if status == "completed" else "❌"
+                    report_lines.append(f"{status_emoji} **{task_id[:16]}...**")
+                    report_lines.append(f"   状态：{status}")
+                    if message:
+                        report_lines.append(f"   内容：{message[:50]}..." if len(message) > 50 else f"   内容：{message}")
+                    report_lines.append("")
+            
+            return "\n".join(report_lines)
+        
+        except Exception as e:
+            logger.error(f"查询状态失败: {e}", exc_info=True)
+            return f"❌ 查询状态失败：{e}"
+    
+    async def reset(self, context: EntryContext) -> str:
+        """
+        重置上下文
+        
+        清理内容：
+        - 历史任务队列
+        - 用户会话状态
+        - 对话历史
+        
+        保留内容：
+        - 系统提示词（代码中的常量）
+        - 配置文件
+        """
+        try:
+            # 清空任务队列
+            cleared_count = await self.task_queue.clear()
+            
+            # 🔧 清空会话历史
+            if hasattr(self, 'session_manager'):
+                self.session_manager.clear_session(
+                    user_id=context.user_id,
+                    chat_id=context.chat_id
+                )
+            
+            logger.info(f"用户 {context.user_id} 重置上下文，清理了 {cleared_count} 个任务")
+            
+            return f"✅ 已重置上下文\n\n清理了 {cleared_count} 个历史任务和对话历史，系统提示词和配置已保留。现在可以开始新的对话了！"
+        
+        except Exception as e:
+            logger.error(f"重置失败: {e}", exc_info=True)
+            return f"❌ 重置失败：{e}"
+    
+    async def status(self, task_id: str) -> str:
+        """
+        查询任务状态
+        """
+        status = await self.task_queue.get_status(task_id)
+        
+        if status.get("status") == "not_found":
+            return f"任务 {task_id} 不存在"
+        
+        status_str = status.get("status", "unknown")
+        wait_time = status.get("wait_time")
+        process_time = status.get("process_time")
+        
+        if status_str == "queued":
+            position = await self.task_queue.get_position(task_id)
+            return f"任务 {task_id} 排队中（第 {position} 位），已等待 {wait_time:.1f} 秒"
+        
+        elif status_str == "processing":
+            return f"任务 {task_id} 处理中，已耗时 {process_time:.1f} 秒"
+        
+        elif status_str == "completed":
+            return f"任务 {task_id} 已完成\n\n结果：{status.get('result', '无')}"
+        
+        elif status_str == "failed":
+            return f"任务 {task_id} 失败\n\n错误：{status.get('error', '未知错误')}"
+        
+        else:
+            return f"任务 {task_id} 状态：{status_str}"
