@@ -34,7 +34,7 @@ feishu:
 
 ```yaml
 tavily:
-  api_key: "tvly-xxx"         # Tavily API 密钥
+  api_key: "your_tavily_key_here"  # Tavily API 密钥
   api_base: "https://api.tavily.com/search"
 ```
 
@@ -156,7 +156,7 @@ agents:
 可以通过环境变量覆盖配置：
 
 ```bash
-export TAVILY_API_KEY="tvly-xxx"
+export TAVILY_API_KEY="your_tavily_key_here"
 export FEISHU_APP_ID="cli_xxx"
 export FEISHU_APP_SECRET="xxx"
 export ENTRY_MODEL_API_KEY="sk-xxx"

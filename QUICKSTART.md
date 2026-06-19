@@ -88,7 +88,7 @@ Bayi-Agent 测试
 ```yaml
 feishu:
   app_id: "your_app_id_here"
-  app_secret: "your_a…here"
+  app_secret: "your_app_secret_here"
 ```
 
 ### 2. 启动 Webhook 服务
